@@ -681,6 +681,7 @@ class CLIPTextTransformer(nn.Module):
         self.embeddings = CLIPTextEmbeddings(config)
         self.encoder = CLIPEncoder(config)
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.num_added_tokens = 0
 
     @add_start_docstrings_to_model_forward(CLIP_TEXT_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=CLIPTextConfig)
@@ -740,7 +741,7 @@ class CLIPTextTransformer(nn.Module):
         # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
         pooled_output = last_hidden_state[
             torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-            [x.index(self.config.vocab_size-3) for x in input_ids.to(dtype=torch.int, device=last_hidden_state.device).tolist()],
+            [x.index(self.config.vocab_size-self.num_added_tokens-1) for x in input_ids.to(dtype=torch.int, device=last_hidden_state.device).tolist()],
         ]
 
         if not return_dict:
