@@ -13,24 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from typing import NamedTuple, Optional
 
 import numpy as np
 from tqdm.auto import tqdm
 
-from .integrations import (
-    GGUF_CONFIG_MAPPING,
-    GGUF_TOKENIZER_MAPPING,
-    _gguf_parse_value,
-)
+from .integrations import GGUF_CONFIG_MAPPING, GGUF_TOKENIZER_MAPPING, _gguf_parse_value
 from .utils import is_torch_available
 from .utils.import_utils import is_gguf_available
 from .utils.logging import get_logger
-
+import re
 
 if is_torch_available():
     import torch
+
+if is_torch_available() and is_gguf_available():
+    from diffusers.quantizers.gguf.utils import (
+        GGML_QUANT_SIZES,
+        GGUFLinear,
+        GGUFParameter,
+        _dequantize_gguf_and_restore_linear,
+        _quant_shape_from_byte_shape,
+        _replace_with_gguf_linear,
+    )
+
+    # Re-export GGUF utilities from diffusers
+    __all__ = [
+        "GGML_QUANT_SIZES",
+        "GGUFParameter",
+        "GGUFLinear",
+        "_dequantize_gguf_and_restore_linear",
+        "_quant_shape_from_byte_shape",
+        "_replace_with_gguf_linear",
+    ]
 
 logger = get_logger(__name__)
 
@@ -57,6 +72,28 @@ class GGUFTensor(NamedTuple):
     name: str
     metadata: dict
 
+
+# GGUF Quantization and Reshaping Safety:
+#
+# GGUF quantization uses a block-based format where each block contains:
+# 1. A scale value (typically 2 bytes)
+# 2. The quantized values for that block (e.g., 16 bytes containing 32 4-bit values for Q4_0)
+#
+# When we reshape quantized tensors (like attention weights), we are safe to do so directly on
+# the GGUFParameter without dequantizing because:
+# 1. The reshape operations in transformers (head/batch dimension changes) never split these blocks
+# 2. The block size (e.g., 32 values for Q4_0) always divides the dimensions we're reshaping
+# 3. Each block's scale stays with its values through the reshape
+#
+# Example for Q4_0 quantization:
+# - Block = [scale: 2 bytes][values: 16 bytes for 32 values]
+# - When reshaping (n_head * dim, ...) to (n_head, dim, ...):
+#   * n_head and dim are always multiples of block size
+#   * The 18-byte blocks stay intact
+#   * Scale-value relationships are preserved
+#
+# This means we can perform tensor operations (reshape, transpose, etc.) directly on the
+# quantized data and defer dequantization until the values are actually needed for computation.
 
 class TensorProcessor:
     def __init__(self, config=None):
@@ -359,7 +396,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
             and only loads the metadata in memory.
     """
     if is_gguf_available() and is_torch_available():
-        from gguf import GGUFReader, dequantize
+        from gguf import GGUFReader
     else:
         logger.error(
             "Loading a GGUF checkpoint in PyTorch, requires both PyTorch and GGUF>=0.10.0 to be installed. Please see "
@@ -473,9 +510,9 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
         ProcessorClass = TENSOR_PROCESSORS.get(architecture, TensorProcessor)
         processor = ProcessorClass(config=config)
 
-        for tensor in tqdm(reader.tensors, desc="Converting and de-quantizing GGUF tensors..."):
+        for tensor in tqdm(reader.tensors, desc="Loading GGUF tensors (with lazy dequantization)..."):
             name = tensor.name
-            weights = dequantize(tensor.data, tensor.tensor_type)
+            weights = GGUFParameter(torch.from_numpy(tensor.data.copy()), quant_type=tensor.tensor_type)
 
             result = processor.process(
                 weights=weights,

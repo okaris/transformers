@@ -5085,7 +5085,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         if from_pt:
             if gguf_file:
-                from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
+                from .modeling_gguf_pytorch_utils import _replace_with_gguf_linear, load_gguf_checkpoint
 
                 # we need a dummy model to get the state_dict - for this reason, we keep the state_dict as if it was
                 # passed directly as a kwarg from now on
@@ -5094,6 +5094,17 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 state_dict = load_gguf_checkpoint(checkpoint_files[0], return_tensors=True, model_to_load=dummy_model)[
                     "tensors"
                 ]
+
+                # Replace Linear layers with GGUFLinear for lazy dequantization
+                compute_dtype = dtype if dtype is not None else torch.get_default_dtype()
+                modules_to_not_convert = getattr(dummy_model, "_keep_in_fp32_modules", [])
+                if modules_to_not_convert is None:
+                    modules_to_not_convert = []
+                _replace_with_gguf_linear(
+                    dummy_model,
+                    compute_dtype,
+                    state_dict,
+                    modules_to_not_convert=modules_to_not_convert)
 
             # Find the correct dtype based on current state
             config, dtype, dtype_orig = _get_dtype(
